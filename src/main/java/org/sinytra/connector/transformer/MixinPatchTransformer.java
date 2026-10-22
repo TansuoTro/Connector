@@ -9,6 +9,7 @@ import com.google.gson.JsonParser;
 import com.mojang.logging.LogUtils;
 import org.sinytra.adapter.patch.transformer.dynamic.DynamicSyntheticInstanceofPatch;
 import org.sinytra.connector.ConnectorUtil;
+import org.sinytra.connector.service.MohistCompat;
 import org.sinytra.connector.transformer.patch.EnvironmentStripperTransformer;
 import org.sinytra.connector.transformer.patch.InterfaceMixinAccessWidener;
 import org.sinytra.connector.transformer.patch.InterfaceMixinInjectorStripper;
@@ -121,6 +122,9 @@ public class MixinPatchTransformer implements Transformer {
     }
 
     public void finalize(Path zipRoot, Collection<String> configs, Map<String, SrgRemappingReferenceMapper.SimpleRefmap> refmapFiles, Set<String> dirtyRefmaps) throws IOException {
+        if (MohistCompat.isMohistRuntime()) {
+            relaxInjectionRequirements(zipRoot, configs);
+        }
         Map<String, MixinClassGenerator.GeneratedClass> generatedMixinClasses = this.environment.classGenerator().getGeneratedMixinClasses();
         if (!generatedMixinClasses.isEmpty()) {
             for (String config : configs) {
@@ -186,6 +190,43 @@ public class MixinPatchTransformer implements Transformer {
                         }
                     }));
             }
+        }
+    }
+
+    /**
+     * Sets {@code injectors.defaultRequire} to 0 for every mixin config of the transformed mod.
+     *
+     * <p>Mohist rewrites large parts of the vanilla classes a Fabric mod targets, so injection points
+     * frequently no longer match. Mixin treats that as a critical error and aborts the whole class
+     * transformation, which the module class loader then reports as a missing class. Requiring 0 turns
+     * those failures into warnings so the mod still loads, with the affected hook inert.
+     */
+    private static void relaxInjectionRequirements(Path zipRoot, Collection<String> configs) throws IOException {
+        for (String config : configs) {
+            Path entry = zipRoot.resolve(config);
+            if (!Files.exists(entry)) {
+                continue;
+            }
+            JsonObject json;
+            try (Reader reader = Files.newBufferedReader(entry, StandardCharsets.UTF_8)) {
+                JsonElement element = JsonParser.parseReader(reader);
+                if (!element.isJsonObject()) {
+                    continue;
+                }
+                json = element.getAsJsonObject();
+            }
+            JsonObject injectors = json.has("injectors") && json.get("injectors").isJsonObject()
+                    ? json.getAsJsonObject("injectors")
+                    : new JsonObject();
+            JsonElement current = injectors.get("defaultRequire");
+            if (current != null && current.isJsonPrimitive() && current.getAsJsonPrimitive().isNumber()
+                    && current.getAsInt() == 0) {
+                continue;
+            }
+            injectors.addProperty("defaultRequire", 0);
+            json.add("injectors", injectors);
+            Files.writeString(entry, new GsonBuilder().disableHtmlEscaping().setPrettyPrinting().create().toJson(json), StandardCharsets.UTF_8);
+            LOGGER.info("Mohist: relaxed injection requirement in {}", config);
         }
     }
 
