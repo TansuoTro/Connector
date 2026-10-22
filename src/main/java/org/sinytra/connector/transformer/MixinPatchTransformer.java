@@ -10,12 +10,16 @@ import com.mojang.logging.LogUtils;
 import org.sinytra.adapter.patch.transformer.dynamic.DynamicSyntheticInstanceofPatch;
 import org.sinytra.connector.ConnectorUtil;
 import org.sinytra.connector.transformer.patch.EnvironmentStripperTransformer;
+import org.sinytra.connector.transformer.patch.InterfaceMixinAccessWidener;
+import org.sinytra.connector.transformer.patch.InterfaceMixinInjectorStripper;
 import net.minecraftforge.fart.api.Transformer;
 import net.minecraftforge.forgespi.locating.IModFile;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.AnnotationNode;
 import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.MethodNode;
 import org.sinytra.adapter.patch.LVTOffsets;
 import org.sinytra.adapter.patch.api.ClassTransform;
 import org.sinytra.adapter.patch.api.MixinClassGenerator;
@@ -69,6 +73,31 @@ public class MixinPatchTransformer implements Transformer {
     private final PatchEnvironment environment;
     private final List<? extends Patch> patches;
 
+    /**
+     * {@link DynamicLVTPatch} calls {@code Locals.getLocalsAt(ClassNode, MethodNode, AbstractInsnNode, int)},
+     * which was added in Mixin 0.12. On 0.8.x the four argument overload takes {@code Locals$Settings}
+     * instead, so applying the patch throws {@link NoSuchMethodError} and aborts the jar transformation.
+     */
+    private static Patch.Builder dynamicPatches(LVTOffsets lvtOffsets) {
+        Patch.Builder builder = Patch.builder()
+            .transform(new DynamicInjectorOrdinalPatch());
+        if (hasExtendedLocalsApi()) {
+            builder.transform(new DynamicLVTPatch(() -> lvtOffsets));
+        }
+        return builder;
+    }
+
+    private static boolean hasExtendedLocalsApi() {
+        try {
+            Class.forName("org.spongepowered.asm.util.Locals", false, MixinPatchTransformer.class.getClassLoader())
+                .getMethod("getLocalsAt", ClassNode.class, MethodNode.class, AbstractInsnNode.class, int.class);
+            return true;
+        } catch (Throwable t) {
+            LOGGER.debug("Extended Locals API not available, skipping DynamicLVTPatch");
+            return false;
+        }
+    }
+
     public MixinPatchTransformer(LVTOffsets lvtOffsets, PatchEnvironment environment, List<? extends Patch> adapterPatches) {
         this.environment = environment;
         this.patches = ImmutableList.<Patch>builder()
@@ -76,9 +105,7 @@ public class MixinPatchTransformer implements Transformer {
             .addAll(adapterPatches)
             .addAll(PATCHES)
             .add(
-                Patch.builder()
-                    .transform(new DynamicInjectorOrdinalPatch())
-                    .transform(new DynamicLVTPatch(() -> lvtOffsets))
+                dynamicPatches(lvtOffsets)
                     .transform(new DynamicAnonymousShadowFieldTypePatch())
                     .transform(new DynamicModifyVarAtReturnPatch())
                     .transform(new DynamicInheritedInjectionPointPatch())
@@ -86,6 +113,8 @@ public class MixinPatchTransformer implements Transformer {
                     .build(),
                 Patch.interfaceBuilder()
                     .transform(new FieldTypePatchTransformer())
+                    .transform(new InterfaceMixinInjectorStripper())
+                    .transform(new InterfaceMixinAccessWidener())
                     .build()
             )
             .build();
